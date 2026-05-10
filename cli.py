@@ -6769,24 +6769,16 @@ class HermesCLI:
             return False
 
     def _should_handle_prompting_command_inline(self, text: str, has_images: bool = False) -> bool:
-        """Return True for slash commands whose handlers synchronously prompt.
+        """Return True for legacy slash handlers that must run inline.
 
-        The prompt_toolkit input loop normally queues slash commands to the
-        process_loop worker thread.  That is fine for non-interactive commands,
-        but commands that call ``_prompt_text_input()`` must run on the UI
-        thread.  Otherwise the worker prints ``Choice [1/2/3]:`` while the
-        prompt_toolkit composer still owns stdin, so the user's ``1``/``2``/``3``
-        is submitted as the next chat message instead of answering the prompt.
+        Destructive session commands used to run inline because their old
+        ``input()`` confirmation prompt could not safely read from the worker
+        thread while prompt_toolkit owned stdin.  They now use the native TUI
+        approval panel when the app is live, so they should stay on the normal
+        worker queue: the UI thread remains free to handle the numbered
+        approve/deny keystrokes, and the worker blocks on a response queue.
         """
-        if not text or has_images or not _looks_like_slash_command(text):
-            return False
-        try:
-            from hermes_cli.commands import resolve_command
-            base = text.split(None, 1)[0].lower().lstrip('/')
-            cmd = resolve_command(base)
-            return bool(cmd and cmd.name in {"clear", "new", "undo", "reload-mcp"})
-        except Exception:
-            return False
+        return False
 
     def _should_handle_steer_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /steer should be dispatched immediately while the agent is running.
@@ -9898,7 +9890,8 @@ class HermesCLI:
         return ""
 
     def _approval_callback(self, command: str, description: str,
-                           *, allow_permanent: bool = True) -> str:
+                           *, allow_permanent: bool = True,
+                           choices: list[str] | None = None) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
@@ -9921,7 +9914,7 @@ class HermesCLI:
             self._approval_state = {
                 "command": command,
                 "description": description,
-                "choices": self._approval_choices(command, allow_permanent=allow_permanent),
+                "choices": choices if choices is not None else self._approval_choices(command, allow_permanent=allow_permanent),
                 "selected": 0,
                 "response_queue": response_queue,
             }

@@ -209,3 +209,21 @@ def test_slash_confirm_display_fragments_include_choice_mapping():
     assert "[2] Always Approve" in rendered
     assert "[3] Cancel" in rendered
     assert "Type 1/2/3" in rendered
+
+
+def test_prompting_slash_commands_use_worker_queue():
+    """Prompting commands should stay on the worker queue so the TUI can capture modal choices."""
+    from cli import HermesCLI
+
+    self_ = SimpleNamespace()
+    should_inline = _bound(HermesCLI._should_handle_prompting_command_inline, self_)
+
+    assert should_inline("/clear") is False
+    assert should_inline("/new") is False
+    assert should_inline("/reset") is False
+    assert should_inline("/undo") is False
+    assert should_inline("/reload-mcp") is False
+    assert should_inline("/help") is False
+    assert should_inline("/model") is False
+    assert should_inline("hello") is False
+    assert should_inline("/clear", has_images=True) is False
