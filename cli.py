@@ -6768,6 +6768,26 @@ class HermesCLI:
         except Exception:
             return False
 
+    def _should_handle_prompting_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True for slash commands whose handlers synchronously prompt.
+
+        The prompt_toolkit input loop normally queues slash commands to the
+        process_loop worker thread.  That is fine for non-interactive commands,
+        but commands that call ``_prompt_text_input()`` must run on the UI
+        thread.  Otherwise the worker prints ``Choice [1/2/3]:`` while the
+        prompt_toolkit composer still owns stdin, so the user's ``1``/``2``/``3``
+        is submitted as the next chat message instead of answering the prompt.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name in {"clear", "new", "undo", "reload-mcp"})
+        except Exception:
+            return False
+
     def _should_handle_steer_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /steer should be dispatched immediately while the agent is running.
 
@@ -11329,6 +11349,18 @@ class HermesCLI:
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
+                    if not self.process_command(text):
+                        self._should_exit = True
+                        if event.app.is_running:
+                            event.app.exit()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    return
+
+                # Handle slash commands that synchronously prompt directly on
+                # the UI thread.  If these are queued to process_loop, the
+                # prompt_toolkit composer keeps owning stdin and the user's
+                # choice (e.g. "1" for /clear) becomes a normal chat message.
+                if self._should_handle_prompting_command_inline(text, has_images=has_images):
                     if not self.process_command(text):
                         self._should_exit = True
                         if event.app.is_running:

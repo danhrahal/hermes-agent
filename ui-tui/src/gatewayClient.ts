@@ -1,8 +1,9 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { delimiter, resolve } from 'node:path'
+import { delimiter, dirname, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 
 import type { GatewayEvent } from './gatewayTypes.js'
 import { CircularBuffer } from './lib/circularBuffer.js'
@@ -17,6 +18,7 @@ const WS_CONNECTING = 0
 const WS_OPEN = 1
 const WS_CLOSING = 2
 const WS_CLOSED = 3
+const _moduleDir = dirname(fileURLToPath(import.meta.url))
 
 const truncateLine = (line: string) =>
   line.length > MAX_LOG_LINE_BYTES ? `${line.slice(0, MAX_LOG_LINE_BYTES)}… [truncated ${line.length} bytes]` : line
@@ -474,7 +476,7 @@ export class GatewayClient extends EventEmitter {
   }
 
   start() {
-    const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
+    const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(_moduleDir, '../../')
     const attachUrl = resolveGatewayAttachUrl()
     const sidecarUrl = resolveSidecarUrl()
 

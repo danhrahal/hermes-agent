@@ -42,9 +42,9 @@ setupGracefulExit({
     }
   ],
   onError: (scope, err) => {
-    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+    const message = err instanceof Error ? (err.stack || `${err.name}: ${err.message}`) : String(err)
 
-    process.stderr.write(`hermes-tui ${scope}: ${message.slice(0, 2000)}\n`)
+    process.stderr.write(`hermes-tui ${scope}: ${message.slice(0, 4000)}\n`)
   },
   onSignal: signal => {
     resetTerminalModes()
