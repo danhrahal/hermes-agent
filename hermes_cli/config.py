@@ -440,6 +440,16 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "afk": {
+        # Optional AFK escalation for unanswered local questions and
+        # background/status alerts. Disabled by default so existing installs
+        # do not send messages without an explicit target.
+        "enabled_by_default": False,
+        "target": "",
+        "escalate_after_seconds": 120,
+        "alert_on": ["unanswered_question", "blocker", "approval_needed", "job_done"],
+    },
+
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).

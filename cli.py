@@ -367,6 +367,12 @@ def load_cli_config() -> Dict[str, Any]:
         "clarify": {
             "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
         },
+        "afk": {
+            "enabled_by_default": False,
+            "target": "",
+            "escalate_after_seconds": 120,
+            "alert_on": ["unanswered_question", "blocker", "approval_needed", "job_done"],
+        },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
             "max_tool_calls": 50,  # Max RPC tool calls per execution
@@ -9787,7 +9793,7 @@ class HermesCLI:
         """
         import time as _time
 
-        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+        timeout = self._clarify_timeout_seconds()
         response_queue = queue.Queue()
         is_open_ended = not choices
 
@@ -9838,10 +9844,81 @@ class HermesCLI:
         self._clarify_deadline = 0
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        self._send_afk_unanswered_question_alert(question, choices, timeout)
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
         )
+
+    def _clarify_timeout_seconds(self) -> int:
+        """Return the clarify wait time, honoring AFK unanswered-question escalation."""
+        clarify_cfg = CLI_CONFIG.get("clarify", {}) if isinstance(CLI_CONFIG, dict) else {}
+        timeout = clarify_cfg.get("timeout", 120) if isinstance(clarify_cfg, dict) else 120
+
+        afk_cfg = CLI_CONFIG.get("afk", {}) if isinstance(CLI_CONFIG, dict) else {}
+        if isinstance(afk_cfg, dict) and is_truthy_value(afk_cfg.get("enabled_by_default", False)):
+            alert_on = afk_cfg.get("alert_on", [])
+            if isinstance(alert_on, str):
+                alert_on = [item.strip() for item in alert_on.split(",") if item.strip()]
+            if "unanswered_question" in set(alert_on or []):
+                timeout = afk_cfg.get("escalate_after_seconds", timeout)
+
+        try:
+            timeout = int(float(timeout))
+        except (TypeError, ValueError):
+            timeout = 120
+        return max(timeout, 1)
+
+    def _send_afk_unanswered_question_alert(self, question, choices, timeout_seconds: int) -> None:
+        """Best-effort Discord/AFK alert when a CLI clarify prompt times out."""
+        afk_cfg = CLI_CONFIG.get("afk", {}) if isinstance(CLI_CONFIG, dict) else {}
+        if not isinstance(afk_cfg, dict):
+            return
+        if not is_truthy_value(afk_cfg.get("enabled_by_default", False)):
+            return
+
+        alert_on = afk_cfg.get("alert_on", [])
+        if isinstance(alert_on, str):
+            alert_on = [item.strip() for item in alert_on.split(",") if item.strip()]
+        if "unanswered_question" not in set(alert_on or []):
+            return
+
+        target = str(afk_cfg.get("target", "")).strip()
+        if not target:
+            return
+
+        lines = [
+            "AFK question timeout from Hermes CLI.",
+            "",
+            f"Question: {str(question).strip()}",
+        ]
+        cleaned_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
+        if cleaned_choices:
+            lines.append("")
+            lines.append("Options:")
+            lines.extend(f"{idx}. {choice}" for idx, choice in enumerate(cleaned_choices, start=1))
+        lines.extend([
+            "",
+            f"No local answer arrived after {timeout_seconds}s.",
+            "Safe default: Hermes will use best judgement and proceed unless the decision is unsafe or explicitly requires approval.",
+            "Continue: answer in the CLI/TUI to unblock this exact session. A Discord reply starts/continues the Discord session unless this task was launched from Discord.",
+        ])
+
+        try:
+            from tools.send_message_tool import send_message_tool
+            result = send_message_tool({
+                "action": "send",
+                "target": target,
+                "message": "\n".join(lines),
+            })
+            try:
+                payload = json.loads(result) if isinstance(result, str) else result
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict) and payload.get("error"):
+                logger.warning("AFK unanswered-question alert failed: %s", payload.get("error"))
+        except Exception as exc:
+            logger.warning("AFK unanswered-question alert failed: %s", exc)
 
     def _sudo_password_callback(self) -> str:
         """
