@@ -11,12 +11,16 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -121,12 +125,325 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    advance_next_run,
+    append_run_history,
+    get_due_jobs,
+    get_job,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+
+def _job_mode(job: dict) -> str:
+    return "no_agent" if job.get("no_agent") else "agent"
+
+
+def _schedule_kind(job: dict) -> str:
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict):
+        return str(schedule.get("kind") or "unknown")
+    return "unknown"
+
+
+def _normalize_history_skills(job: dict) -> list[str]:
+    raw = job.get("skills")
+    if raw is None:
+        raw_items = [job.get("skill")] if job.get("skill") else []
+    elif isinstance(raw, str):
+        raw_items = [raw]
+    else:
+        raw_items = list(raw)
+    normalized: list[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _error_type(error: str | None) -> str | None:
+    if not error:
+        return None
+    text = str(error).strip()
+    if not text:
+        return None
+    first = text.splitlines()[0].strip()
+    match = re.match(r"^([A-Za-z_][\w.]*?(?:Error|Exception|Timeout|Failure|Blocked)?)(?::|\s-)", first)
+    if match:
+        return match.group(1)[:120]
+    if "blocked" in text.lower():
+        return "blocked"
+    return first[:120]
+
+
+def _normalize_error_text(error: str | None) -> str:
+    text = str(error or "").strip().lower()
+    text = re.sub(r"\d+", "#", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _error_fingerprint(error: str | None) -> str | None:
+    normalized = _normalize_error_text(error)
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _sanitize_history_error(error: str | None, *, max_len: int = 500) -> str | None:
+    """Return a concise, non-identifying error summary for run history rows.
+
+    Full script stdout/stderr and raw delivery target IDs belong in the saved
+    output file/logs, not the structured history row that dashboards and CLIs
+    read by default.
+    """
+    if not error:
+        return None
+    text = str(error).strip()
+    if not text:
+        return None
+
+    # Redact platform:chat/thread targets while preserving the platform label.
+    platform_pattern = r"\b(telegram|discord|slack|matrix|mattermost|signal|sms|email|whatsapp|webhook|feishu|wecom|weixin|qqbot|yuanbao|bluebubbles):[^\s,)]+"
+    text = re.sub(platform_pattern, r"\1:<redacted>", text, flags=re.IGNORECASE)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    summary = lines[0]
+    if len(lines) > 1:
+        summary = f"{summary} (details saved in output_path)"
+    if len(summary) > max_len:
+        summary = summary[: max_len - 1].rstrip() + "…"
+    return summary
+
+
+def _delivery_targets(deliver) -> list[str]:
+    if deliver is None:
+        raw_items = ["local"]
+    elif isinstance(deliver, str):
+        raw_items = [deliver]
+    else:
+        raw_items = list(deliver)
+    targets: list[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        label = text.split(":", 1)[0].strip().lower() or text.lower()
+        if label and label not in targets:
+            targets.append(label)
+    return targets
+
+
+def _external_delivery_expected(job: dict, should_deliver: bool) -> bool:
+    if not should_deliver:
+        return False
+    targets = _delivery_targets(job.get("deliver"))
+    if not targets:
+        return False
+    return any(target not in {"local", "log"} for target in targets)
+
+
+def _parse_iso_datetime(value: str | None):
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _compute_due_lag_ms(scheduled_for: str | None, started_at: str | None) -> int | None:
+    scheduled = _parse_iso_datetime(scheduled_for)
+    started = _parse_iso_datetime(started_at)
+    if not scheduled or not started:
+        return None
+    try:
+        return max(0, int((started - scheduled).total_seconds() * 1000))
+    except Exception:
+        return None
+
+
+def _rollup_cron_run_status(
+    *,
+    processing_error: bool,
+    success: bool,
+    silent: bool,
+    external_delivery_expected: bool,
+    delivery_error: str | None,
+) -> str:
+    if processing_error:
+        return "processing_error"
+    if not success:
+        return "error"
+    if delivery_error and external_delivery_expected:
+        return "delivery_error"
+    if silent:
+        return "silent"
+    return "ok"
+
+
+def _response_status(success: bool, final_response: str | None, silent: bool, empty_final_response: bool, job: dict) -> str:
+    text = str(final_response or "")
+    if not success and final_response:
+        return "failure_alert"
+    if silent and SILENT_MARKER in text.strip().upper():
+        if job.get("no_agent") and not text.strip().replace(SILENT_MARKER, "").strip():
+            return "no_agent_empty"
+        return "silent_marker"
+    if empty_final_response or not text:
+        return "empty"
+    return "non_empty"
+
+
+def _delivery_status(
+    *,
+    success: bool,
+    should_deliver: bool,
+    silent: bool,
+    delivery_error: str | None,
+    external_delivery_expected: bool,
+    job: dict,
+    final_response: str | None,
+) -> str:
+    if delivery_error:
+        return "delivery_error"
+    if silent:
+        return "skipped_silent"
+    if not should_deliver:
+        if not final_response:
+            return "skipped_no_content"
+        return "skipped_no_target"
+    if not success and not should_deliver:
+        return "not_attempted_error"
+    if not external_delivery_expected and "local" in _delivery_targets(job.get("deliver")):
+        return "skipped_local"
+    return "delivered"
+
+
+def _file_sha256(path) -> str | None:
+    if not path:
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _build_cron_run_record(
+    *,
+    job: dict,
+    run_id: str,
+    tick_id: str,
+    scheduled_for: str | None,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    success: bool,
+    output: str | None,
+    final_response: str | None,
+    error: str | None,
+    delivery_error: str | None,
+    should_deliver: bool,
+    external_delivery_expected: bool,
+    silent: bool,
+    empty_final_response: bool,
+    processing_error: bool,
+    output_file=None,
+    session_id: str | None = None,
+) -> dict:
+    output_path = str(output_file) if output_file else None
+    try:
+        output_bytes = Path(output_file).stat().st_size if output_file else None
+    except Exception:
+        output_bytes = len((output or "").encode("utf-8")) if output is not None else None
+    final_response_bytes = len((final_response or "").encode("utf-8")) if final_response is not None else 0
+    current_job = None
+    try:
+        current_job = get_job(job.get("id"))
+    except Exception:
+        current_job = None
+    next_run_at_after = (current_job or {}).get("next_run_at")
+    exec_status = "processing_error" if processing_error else ("failed" if not success else "succeeded")
+    if error and "blocked" in str(error).lower():
+        exec_status = "blocked"
+    response_status = _response_status(success, final_response, silent, empty_final_response, job)
+    delivery_status = _delivery_status(
+        success=success,
+        should_deliver=should_deliver,
+        silent=silent,
+        delivery_error=delivery_error,
+        external_delivery_expected=external_delivery_expected,
+        job=job,
+        final_response=final_response,
+    )
+    status = _rollup_cron_run_status(
+        processing_error=processing_error,
+        success=success,
+        silent=silent,
+        external_delivery_expected=external_delivery_expected,
+        delivery_error=delivery_error,
+    )
+    history_error = _sanitize_history_error(error)
+    history_delivery_error = _sanitize_history_error(delivery_error)
+    return {
+        "schema_version": 1,
+        "event_type": "run_attempt",
+        "run_id": run_id,
+        "tick_id": tick_id,
+        "job_id": job.get("id"),
+        "job_name": job.get("name"),
+        "schedule_kind": _schedule_kind(job),
+        "schedule_display": job.get("schedule_display"),
+        "scheduled_for": scheduled_for,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": max(0, int(duration_ms or 0)),
+        "due_lag_ms": _compute_due_lag_ms(scheduled_for, started_at),
+        "next_run_at_after": next_run_at_after,
+        "mode": _job_mode(job),
+        "success": bool(success),
+        "status": status,
+        "execution_status": exec_status,
+        "response_status": response_status,
+        "delivery_status": delivery_status,
+        "error": history_error,
+        "error_type": _error_type(history_error),
+        "error_fingerprint": _error_fingerprint(error),
+        "delivery_error": history_delivery_error,
+        "delivery_error_type": _error_type(history_delivery_error),
+        "delivery_error_fingerprint": _error_fingerprint(delivery_error),
+        "should_deliver": bool(should_deliver),
+        "external_delivery_expected": bool(external_delivery_expected),
+        "silent": bool(silent),
+        "empty_final_response": bool(empty_final_response),
+        "output_path": output_path,
+        "output_bytes": output_bytes,
+        "output_sha256": _file_sha256(output_file),
+        "final_response_bytes": final_response_bytes,
+        "deliver": ",".join(_delivery_targets(job.get("deliver"))),
+        "delivery_targets": _delivery_targets(job.get("deliver")),
+        "session_id": session_id,
+        "model": job.get("model"),
+        "provider": job.get("provider"),
+        "no_agent": bool(job.get("no_agent")),
+        "script": job.get("script"),
+        "workdir": job.get("workdir"),
+        "toolsets": job.get("enabled_toolsets"),
+        "skills": _normalize_history_skills(job),
+    }
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -1688,6 +2005,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
     try:
         due_jobs = get_due_jobs()
+        tick_id = uuid.uuid4().hex
+        scheduled_for_by_job_id = {job.get("id"): job.get("next_run_at") for job in due_jobs}
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
@@ -1730,6 +2049,24 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            run_id = uuid.uuid4().hex
+            scheduled_for = scheduled_for_by_job_id.get(job.get("id"))
+            started = _hermes_now()
+            started_at = started.isoformat()
+            monotonic_start = time.monotonic()
+
+            success = False
+            output = ""
+            final_response = ""
+            error = None
+            delivery_error = None
+            output_file = None
+            should_deliver = False
+            external_expected = False
+            silent = False
+            empty_final_response = False
+            processing_error = False
+
             try:
                 success, output, final_response, error = run_job(job)
 
@@ -1742,11 +2079,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                silent = bool(should_deliver and success and SILENT_MARKER in deliver_content.strip().upper())
+                if silent:
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
-                delivery_error = None
+                external_expected = _external_delivery_expected(job, should_deliver)
                 if should_deliver:
                     try:
                         delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
@@ -1759,15 +2097,49 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # (issue #8585)
                 if success and not final_response:
                     success = False
+                    empty_final_response = True
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 return True
 
             except Exception as e:
+                processing_error = True
+                success = False
+                error = str(e)
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                try:
+                    mark_job_run(job["id"], False, str(e))
+                except Exception as mark_exc:
+                    logger.warning("Failed to mark cron job %s failed: %s", job.get("id"), mark_exc)
                 return False
+            finally:
+                ended_at = _hermes_now().isoformat()
+                duration_ms = int((time.monotonic() - monotonic_start) * 1000)
+                try:
+                    record = _build_cron_run_record(
+                        job=job,
+                        run_id=run_id,
+                        tick_id=tick_id,
+                        scheduled_for=scheduled_for,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        duration_ms=duration_ms,
+                        success=success,
+                        output=output,
+                        final_response=final_response,
+                        error=error,
+                        delivery_error=delivery_error,
+                        should_deliver=should_deliver,
+                        external_delivery_expected=external_expected,
+                        silent=silent,
+                        empty_final_response=empty_final_response,
+                        processing_error=processing_error,
+                        output_file=output_file,
+                    )
+                    append_run_history(record)
+                except Exception as hist_exc:
+                    logger.warning("Failed to append cron run history for job %s: %s", job.get("id"), hist_exc)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —

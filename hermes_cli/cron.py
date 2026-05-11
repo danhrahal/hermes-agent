@@ -129,14 +129,95 @@ def cron_tick():
     tick(verbose=True)
 
 
-def cron_status():
-    """Show cron execution status."""
-    from cron.jobs import list_jobs
+def _is_failure_status(status: str) -> bool:
+    return status not in {"ok", "silent"}
+
+
+def _build_cron_status_snapshot(jobs, rows, pids):
+    """Build a compact cron reliability snapshot from job metadata + run history."""
+    active_jobs = [job for job in jobs if job.get("state") not in {"paused", "completed"} and job.get("enabled", True)]
+    next_runs = [job.get("next_run_at") for job in active_jobs if job.get("next_run_at")]
+
+    status_counts = {}
+    rows_by_job = {}
+    for row in sorted(rows, key=lambda r: str(r.get("started_at") or ""), reverse=True):
+        status = str(row.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        job_id = row.get("job_id")
+        if job_id:
+            rows_by_job.setdefault(job_id, []).append(row)
+
+    job_summaries = []
+    for job in sorted(jobs, key=lambda j: (str(j.get("name") or ""), str(j.get("id") or ""))):
+        job_rows = rows_by_job.get(job.get("id"), [])
+        last_row = job_rows[0] if job_rows else None
+        last_success = next((row for row in job_rows if not _is_failure_status(str(row.get("status") or ""))), None)
+        last_failure = next((row for row in job_rows if _is_failure_status(str(row.get("status") or ""))), None)
+        consecutive_failures = 0
+        for row in job_rows:
+            if _is_failure_status(str(row.get("status") or "")):
+                consecutive_failures += 1
+            else:
+                break
+        durations = [int(row.get("duration_ms") or 0) for row in job_rows if row.get("duration_ms") is not None]
+        job_summaries.append(
+            {
+                "job_id": job.get("id"),
+                "name": job.get("name"),
+                "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
+                "next_run_at": job.get("next_run_at"),
+                "history_count": len(job_rows),
+                "last_run_at": last_row.get("started_at") if last_row else job.get("last_run_at"),
+                "last_status": last_row.get("status") if last_row else job.get("last_status"),
+                "last_success_at": last_success.get("started_at") if last_success else None,
+                "last_failure_at": last_failure.get("started_at") if last_failure else None,
+                "consecutive_failures": consecutive_failures,
+                "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,
+                "last_duration_ms": last_row.get("duration_ms") if last_row else None,
+                "last_output_bytes": last_row.get("output_bytes") if last_row else None,
+                "delivery_failures": sum(1 for row in job_rows if row.get("status") == "delivery_error"),
+                "silent_runs": sum(1 for row in job_rows if row.get("status") == "silent"),
+                "empty_response_runs": sum(1 for row in job_rows if row.get("response_status") == "empty"),
+            }
+        )
+
+    return {
+        "gateway_running": bool(pids),
+        "gateway_pids": list(pids),
+        "active_jobs": len(active_jobs),
+        "total_jobs": len(jobs),
+        "next_run_at": min(next_runs) if next_runs else None,
+        "history_count": len(rows),
+        "status_counts": status_counts,
+        "jobs": job_summaries,
+    }
+
+
+def _status_color(status: str):
+    if status in {"ok", "silent"}:
+        return Colors.GREEN if status == "ok" else Colors.DIM
+    if status == "delivery_error":
+        return Colors.YELLOW
+    return Colors.RED
+
+
+def cron_status(args=None):
+    """Show cron scheduler and recent execution health."""
+    from cron.jobs import list_jobs, list_run_history
     from hermes_cli.gateway import find_gateway_pids
+
+    limit = int(getattr(args, "history_limit", 500) or 500)
+    pids = find_gateway_pids()
+    jobs = list_jobs(include_disabled=True)
+    rows = list_run_history(limit=limit)
+    snapshot = _build_cron_status_snapshot(jobs, rows, pids)
+
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return 0
 
     print()
 
-    pids = find_gateway_pids()
     if pids:
         print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
         print(f"  PID: {', '.join(map(str, pids))}")
@@ -149,17 +230,46 @@ def cron_status():
         print("    hermes gateway            # Or run in foreground")
 
     print()
+    print(f"  {snapshot['active_jobs']} active job(s), {snapshot['total_jobs']} total job(s)")
+    if snapshot.get("next_run_at"):
+        print(f"  Next run: {snapshot['next_run_at']}")
+    print(f"  Recent run rows sampled: {snapshot['history_count']}")
+    if snapshot["status_counts"]:
+        counts = ", ".join(f"{status}={count}" for status, count in sorted(snapshot["status_counts"].items()))
+        print(f"  Recent statuses: {counts}")
 
-    jobs = list_jobs(include_disabled=False)
-    if jobs:
-        next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
-        print(f"  {len(jobs)} active job(s)")
-        if next_runs:
-            print(f"  Next run: {min(next_runs)}")
+    if snapshot["jobs"]:
+        print()
+        print(color("  Job health", Colors.CYAN))
+        for summary in snapshot["jobs"]:
+            status = str(summary.get("last_status") or "never")
+            status_display = color(status, _status_color(status)) if status != "never" else color(status, Colors.DIM)
+            failures = summary.get("consecutive_failures") or 0
+            failure_text = f", consecutive failures: {failures}" if failures else ""
+            print(f"  - {summary.get('name') or summary.get('job_id')} ({summary.get('job_id')})")
+            print(f"      state={summary.get('state')} last={status_display} at {summary.get('last_run_at') or '-'}{failure_text}")
+            if summary.get("last_success_at"):
+                print(f"      last success: {summary.get('last_success_at')}")
+            if summary.get("last_failure_at"):
+                print(f"      last failure: {summary.get('last_failure_at')}")
+            if summary.get("avg_duration_ms") is not None:
+                print(
+                    f"      avg duration: {_fmt_duration_ms(summary.get('avg_duration_ms'))}; "
+                    f"last output: {summary.get('last_output_bytes') if summary.get('last_output_bytes') is not None else '-'} bytes"
+                )
+            if summary.get("delivery_failures") or summary.get("silent_runs") or summary.get("empty_response_runs"):
+                print(
+                    "      flags: "
+                    f"delivery_failures={summary.get('delivery_failures')}, "
+                    f"silent={summary.get('silent_runs')}, "
+                    f"empty_response={summary.get('empty_response_runs')}"
+                )
     else:
-        print("  No active jobs")
+        print()
+        print("  No configured jobs")
 
     print()
+    return 0
 
 
 def cron_create(args):
@@ -267,6 +377,76 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def _fmt_duration_ms(ms) -> str:
+    try:
+        ms = int(ms or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if ms < 1000:
+        return f"{ms}ms"
+    return f"{ms / 1000:.1f}s"
+
+
+def cron_history(args):
+    """Show recent cron run history."""
+    from datetime import timedelta
+    from hermes_time import now as _hermes_now
+    from cron.jobs import list_run_history
+
+    limit = getattr(args, "limit", 20) or 20
+    job_id = getattr(args, "job_id", None)
+    status = getattr(args, "status", None)
+    since = getattr(args, "since", None)
+    days = getattr(args, "days", None)
+    if days and not since:
+        since = (_hermes_now() - timedelta(days=int(days))).isoformat()
+
+    rows = list_run_history(job_id=job_id, limit=limit, since=since, status=status)
+
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+
+    print()
+    print(color("┌─────────────────────────────────────────────────────────────────────────┐", Colors.CYAN))
+    print(color("│                         Cron Run History                                │", Colors.CYAN))
+    print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
+    print()
+
+    if not rows:
+        print(color("No cron run history yet.", Colors.DIM))
+        print()
+        return 0
+
+    for row in rows:
+        status_value = str(row.get("status") or "?")
+        if status_value == "ok":
+            status_display = color(status_value, Colors.GREEN)
+        elif status_value == "silent":
+            status_display = color(status_value, Colors.DIM)
+        elif status_value == "delivery_error":
+            status_display = color(status_value, Colors.YELLOW)
+        else:
+            status_display = color(status_value, Colors.RED)
+        print(f"  {row.get('started_at', '-')}  {status_display}  {row.get('job_name') or row.get('job_id', '?')}")
+        print(f"    Job:        {row.get('job_id', '-')}")
+        if row.get("scheduled_for"):
+            print(f"    Scheduled:  {row.get('scheduled_for')}")
+        if row.get("due_lag_ms") is not None:
+            print(f"    Due lag:    {_fmt_duration_ms(row.get('due_lag_ms'))}")
+        print(f"    Duration:   {_fmt_duration_ms(row.get('duration_ms'))}")
+        print(f"    Execution:  {row.get('execution_status', '-')}")
+        print(f"    Response:   {row.get('response_status', '-')}")
+        print(f"    Delivery:   {row.get('delivery_status', '-')}")
+        print(f"    Output:     {row.get('output_bytes', 0)} bytes  {row.get('output_path') or '-'}")
+        if row.get("error"):
+            print(f"    Error:      {row.get('error')}")
+        if row.get("delivery_error"):
+            print(f"    Delivery error: {row.get('delivery_error')}")
+        print()
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -277,12 +457,14 @@ def cron_command(args):
         return 0
 
     if subcmd == "status":
-        cron_status()
-        return 0
+        return cron_status(args)
 
     if subcmd == "tick":
         cron_tick()
         return 0
+
+    if subcmd == "history":
+        return cron_history(args)
 
     if subcmd in {"create", "add"}:
         return cron_create(args)
@@ -303,5 +485,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick|history]")
     sys.exit(1)

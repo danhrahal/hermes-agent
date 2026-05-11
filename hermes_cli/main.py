@@ -9916,7 +9916,18 @@ def main():
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
     # cron status
-    cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
+    cron_status = cron_subparsers.add_parser("status", help="Show cron scheduler and recent run health")
+    cron_status.add_argument("--history-limit", type=int, default=500, help="Number of recent run-history rows to analyze")
+    cron_status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    # cron history
+    cron_history = cron_subparsers.add_parser("history", help="Show recent cron run history")
+    cron_history.add_argument("job_id", nargs="?", help="Optional job ID to filter")
+    cron_history.add_argument("--limit", type=int, default=20, help="Number of recent runs to show")
+    cron_history.add_argument("--status", help="Filter by rollup status")
+    cron_history.add_argument("--days", type=int, help="Only show runs from the last N days")
+    cron_history.add_argument("--since", help="Only show runs at or after this ISO timestamp")
+    cron_history.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
