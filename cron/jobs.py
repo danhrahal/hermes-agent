@@ -43,6 +43,8 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
+RUNS_FILE = CRON_DIR / "runs.jsonl"
+_runs_file_lock = threading.Lock()
 ONESHOT_GRACE_SECONDS = 120
 
 
@@ -995,6 +997,76 @@ def save_job_output(job_id: str, output: str):
         raise
     
     return output_file
+
+
+def append_run_history(record: Dict[str, Any]) -> None:
+    """Append one structured cron run-history row to runs.jsonl."""
+    ensure_dirs()
+    row = dict(record)
+    row.setdefault("schema_version", 1)
+    row.setdefault("event_type", "run_attempt")
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+
+    with _runs_file_lock:
+        with open(RUNS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(RUNS_FILE)
+
+
+def list_run_history(
+    job_id: Optional[str] = None,
+    limit: int = 50,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    status: Optional[Union[str, List[str]]] = None,
+) -> List[Dict[str, Any]]:
+    """Return recent cron run-history rows, newest first.
+
+    Readers intentionally tolerate malformed/partial JSONL lines so a torn
+    final append never prevents the CLI/dashboard from reading older rows.
+    """
+    ensure_dirs()
+    if limit <= 0:
+        return []
+    if not RUNS_FILE.exists():
+        return []
+
+    statuses = None
+    if status is not None:
+        if isinstance(status, str):
+            statuses = {status}
+        else:
+            statuses = {str(item) for item in status}
+
+    rows: List[Dict[str, Any]] = []
+    with _runs_file_lock:
+        with open(RUNS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Skipping malformed cron run-history row")
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                row_started = str(row.get("started_at") or "")
+                if job_id and row.get("job_id") != job_id:
+                    continue
+                if statuses is not None and row.get("status") not in statuses:
+                    continue
+                if since and row_started and row_started < since:
+                    continue
+                if until and row_started and row_started > until:
+                    continue
+                rows.append(row)
+
+    rows.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
+    return rows[:limit]
 
 
 # =============================================================================
