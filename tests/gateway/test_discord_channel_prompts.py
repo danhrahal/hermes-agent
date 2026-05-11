@@ -130,6 +130,26 @@ class TestResolveChannelPrompts:
         adapter.config.extra = {"channel_prompts": {"200": "Forum prompt"}}
         assert adapter._resolve_channel_prompt("999", parent_id="200") == "Forum prompt"
 
+    def test_default_prompt_used_when_no_channel_or_parent_match(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"default": "Voice inbox mode"}}
+        assert adapter._resolve_channel_prompt("999", parent_id="200") == "Voice inbox mode"
+
+    def test_star_prompt_used_when_no_default_match(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"*": "Catch-all mode"}}
+        assert adapter._resolve_channel_prompt("999") == "Catch-all mode"
+
+    def test_exact_channel_overrides_default_prompt(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "999": "Thread override",
+                "default": "Voice inbox mode",
+            }
+        }
+        assert adapter._resolve_channel_prompt("999") == "Thread override"
+
     def test_exact_channel_overrides_parent(self):
         adapter = _make_adapter()
         adapter.config.extra = {
