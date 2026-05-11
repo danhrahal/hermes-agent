@@ -1210,3 +1210,49 @@ class TestApprovalUnavailableMessaging:
         assert "approval request timed out" in result["message"]
         assert "User denied" not in result["message"]
         assert "user denied" not in result["message"].lower()
+
+
+class TestExternalSubmissionGuard:
+    """Regression tests for commands that publish outside the local machine."""
+
+    def _allow_tirith(self):
+        return mock_patch(
+            "tools.tirith_security.check_command_security",
+            return_value={"action": "allow", "findings": [], "summary": ""},
+        )
+
+    def test_detects_gh_pr_create_as_external_submission(self):
+        is_external, key, desc = approval_module.detect_external_submission_command(
+            'gh pr create --repo NousResearch/hermes-agent --title "fix" --body-file /tmp/body.md'
+        )
+
+        assert is_external is True
+        assert key == "external submission: GitHub pull request creation"
+        assert "pull request" in desc.lower()
+
+    def test_external_submission_requires_approval_even_in_yolo(self):
+        with mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1", "HERMES_YOLO_MODE": "1"}, clear=False):
+            with mock_patch("tools.approval._get_approval_mode", return_value="off"):
+                with self._allow_tirith():
+                    result = approval_module.check_all_command_guards(
+                        'gh pr create --repo NousResearch/hermes-agent --title "fix" --body-file /tmp/body.md',
+                        "local",
+                        approval_callback=lambda *args, **kwargs: "deny",
+                    )
+
+        assert result["approved"] is False
+        assert "external submission" in result["description"].lower()
+        assert result["message"] == "BLOCKED: User denied. Do NOT retry."
+
+    def test_cron_external_submission_fails_closed_without_user(self):
+        with mock_patch.dict("os.environ", {"HERMES_CRON_SESSION": "1"}, clear=False):
+            with mock_patch("tools.approval._get_approval_mode", return_value="manual"):
+                with self._allow_tirith():
+                    result = approval_module.check_all_command_guards(
+                        'gh pr create --repo NousResearch/hermes-agent --title "fix" --body-file /tmp/body.md',
+                        "local",
+                    )
+
+        assert result["approved"] is False
+        assert "external submission" in result["message"].lower()
+        assert "cron jobs run without a user present" in result["message"]

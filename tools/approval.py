@@ -421,6 +421,46 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 
 
 # =========================================================================
+# External submission guard
+# =========================================================================
+# Commands that publish state, messages, issues, PRs, packages, or similar
+# artifacts outside the local machine. These are not necessarily destructive,
+# but they cross Daniel's explicit-confirmation boundary: a local draft is OK;
+# submitting/publishing requires a current user approval. Unlike ordinary
+# dangerous commands, this guard intentionally runs before --yolo /
+# approvals.mode=off so automation shortcuts cannot silently publish externally.
+EXTERNAL_SUBMISSION_PATTERNS = [
+    (r'\bgh\s+pr\s+create\b', "GitHub pull request creation"),
+    (r'\bgh\s+issue\s+create\b', "GitHub issue creation"),
+    (r'\bgh\s+release\s+create\b', "GitHub release creation"),
+    (r'\bgit\s+push\b(?!.*\b--dry-run\b)', "git push to remote"),
+    (r'\bnpm\s+publish\b(?!.*\b--dry-run\b)', "npm package publish"),
+    (r'\b(?:python\s+-m\s+)?twine\s+upload\b', "Python package upload"),
+    (r'\bxurl\s+post\b', "X/Twitter post"),
+    (r'\b(himalaya|aerc|mutt)\b.*\bsend\b', "email send"),
+    (r'\bcurl\b[^\n]*\b-X\s*(POST|PUT|PATCH)\b[^\n]*api\.github\.com/repos/[^\s]+/(pulls|issues|releases)', "GitHub API submission"),
+]
+
+EXTERNAL_SUBMISSION_PATTERNS_COMPILED = [
+    (re.compile(pattern, _RE_FLAGS), description)
+    for pattern, description in EXTERNAL_SUBMISSION_PATTERNS
+]
+
+
+def detect_external_submission_command(command: str) -> tuple:
+    """Check if a command appears to publish an external artifact.
+
+    Returns:
+        (is_external, pattern_key, description) or (False, None, None)
+    """
+    command_lower = _normalize_command_for_detection(command).lower()
+    for pattern_re, description in EXTERNAL_SUBMISSION_PATTERNS_COMPILED:
+        if pattern_re.search(command_lower):
+            return (True, f"external submission: {description}", description)
+    return (False, None, None)
+
+
+# =========================================================================
 # Detection
 # =========================================================================
 
@@ -1080,27 +1120,60 @@ def check_all_command_guards(command: str, env_type: str,
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
     # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
+    # SUDO_PASSWORD has been configured. This must fire BEFORE the yolo
     # check so even yolo/smart approval/mode=off cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
+        logger.warning(
+            "Sudo stdin guard block: %s (command: %s)",
+            sudo_guess_desc,
+            command[:200],
+        )
         return _sudo_stdin_block_result(sudo_guess_desc)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # External-submission guard: publishing outside the local machine crosses
+    # the explicit-confirmation boundary, so detect it BEFORE --yolo /
+    # approvals.mode=off. A session approval may still carry within the same
+    # approval context, but automation shortcuts cannot silently bypass it.
+    is_external, external_key, external_desc = detect_external_submission_command(command)
+    session_key = get_current_session_key()
+    external_requires_approval = bool(
+        is_external and not is_approved(session_key, external_key)
+    )
+
+    # --yolo or approvals.mode=off: bypass ordinary approval prompts, but not
+    # external submissions that still need a current user approval.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        not external_requires_approval
+        and (
+            is_truthy_value(os.getenv("HERMES_YOLO_MODE"))
+            or is_current_session_yolo_enabled()
+            or approval_mode == "off"
+        )
+    ):
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
     is_ask = os.getenv("HERMES_EXEC_ASK")
 
-    # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
+    # Preserve the existing non-interactive behavior for ordinary warnings, but
+    # fail closed for external submissions: cron/batch contexts have no user
+    # present to approve publication.
     if not is_cli and not is_gateway and not is_ask:
+        if external_requires_approval:
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: External submission requires explicit user approval "
+                    f"({external_desc}), but cron jobs run without a user present "
+                    "to approve it. Draft locally and ask the user before publishing."
+                ),
+                "pattern_key": external_key,
+                "description": f"external submission: {external_desc}",
+            }
         # Cron sessions: respect cron_mode config
         if os.getenv("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -1136,7 +1209,7 @@ def check_all_command_guards(command: str, env_type: str,
     # --- Phase 2: Decide ---
 
     # Collect warnings that need approval
-    warnings = []  # list of (pattern_key, description, is_tirith)
+    warnings = []  # list of (pattern_key, description, is_tirith, is_external)
 
     session_key = get_current_session_key()
 
@@ -1150,11 +1223,14 @@ def check_all_command_guards(command: str, env_type: str,
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
         if not is_approved(session_key, tirith_key):
-            warnings.append((tirith_key, tirith_desc, True))
+            warnings.append((tirith_key, tirith_desc, True, False))
+
+    if external_requires_approval:
+        warnings.append((external_key, f"External submission: {external_desc}", False, True))
 
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
-            warnings.append((pattern_key, description, False))
+            warnings.append((pattern_key, description, False, False))
 
     # Nothing to warn about
     if not warnings:
@@ -1164,12 +1240,13 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
-        combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
+    has_external = any(is_ext for _, _, _, is_ext in warnings)
+    if approval_mode == "smart" and not has_external:
+        combined_desc_for_llm = "; ".join(desc for _, desc, _, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
             # Auto-approve and grant session-level approval for these patterns
-            for key, _, _ in warnings:
+            for key, _, _, _ in warnings:
                 approve_session(session_key, key)
             logger.debug("Smart approval: auto-approved '%s' (%s)",
                          command[:60], combined_desc_for_llm)
@@ -1177,7 +1254,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
         elif verdict == "deny":
-            combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
+            combined_desc_for_llm = "; ".join(desc for _, desc, _, _ in warnings)
             return {
                 "approved": False,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
@@ -1189,10 +1266,10 @@ def check_all_command_guards(command: str, env_type: str,
     # --- Phase 3: Approval ---
 
     # Combine descriptions for a single approval prompt
-    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    combined_desc = "; ".join(desc for _, desc, _, _ in warnings)
     primary_key = warnings[0][0]
-    all_keys = [key for key, _, _ in warnings]
-    has_tirith = any(is_t for _, _, is_t in warnings)
+    all_keys = [key for key, _, _, _ in warnings]
+    has_tirith = any(is_t for _, _, is_t, _ in warnings)
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
@@ -1323,8 +1400,8 @@ def check_all_command_guards(command: str, env_type: str,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
-            for key, _, is_tirith in warnings:
-                if choice == "session" or (choice == "always" and is_tirith):
+            for key, _, is_tirith, is_external_warning in warnings:
+                if choice == "session" or (choice == "always" and (is_tirith or is_external_warning)):
                     approve_session(session_key, key)
                 elif choice == "always":
                     approve_session(session_key, key)
@@ -1367,7 +1444,7 @@ def check_all_command_guards(command: str, env_type: str,
         surface="cli",
     )
     choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
+                                       allow_permanent=not (has_tirith or has_external),
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -1405,9 +1482,9 @@ def check_all_command_guards(command: str, env_type: str,
         }
 
     # Persist approval for each warning individually
-    for key, _, is_tirith in warnings:
-        if choice == "session" or (choice == "always" and is_tirith):
-            # tirith: session only (no permanent broad allowlisting)
+    for key, _, is_tirith, is_external_warning in warnings:
+        if choice == "session" or (choice == "always" and (is_tirith or is_external_warning)):
+            # tirith/external-submission: session only (no permanent broad allowlisting)
             approve_session(session_key, key)
         elif choice == "always":
             # dangerous patterns: permanent allowed
