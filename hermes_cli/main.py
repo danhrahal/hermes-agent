@@ -1107,6 +1107,22 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     return [node, str(tui_dir / "dist" / "entry.js")], tui_dir
 
 
+def _tui_argv_uses_node(argv: list[str]) -> bool:
+    """Return true when the TUI argv directly invokes the node binary."""
+
+    if not argv:
+        return False
+    return Path(argv[0]).name == "node"
+
+
+def _add_tui_node_argv_flags(argv: list[str]) -> list[str]:
+    """Add Node-only flags that are rejected when passed via NODE_OPTIONS."""
+
+    if not _tui_argv_uses_node(argv) or "--expose-gc" in argv:
+        return argv
+    return [argv[0], "--expose-gc", *argv[1:]]
+
+
 def _normalize_tui_toolsets(toolsets: object) -> list[str]:
     """Normalize argparse/Fire-style toolset input for the TUI subprocess."""
     try:
@@ -1226,21 +1242,22 @@ def _launch_tui(
         env["HERMES_TUI_TOOL_PROGRESS"] = "off"
     if accept_hooks:
         env["HERMES_ACCEPT_HOOKS"] = "1"
+    argv, cwd = _make_tui_argv(tui_dir, tui_dev)
+
     # Guarantee an 8GB V8 heap + exposed GC for the TUI. Default node cap is
     # ~1.5–4GB depending on version and can fatal-OOM on long sessions with
-    # large transcripts / reasoning blobs. Token-level merge: respect any
-    # user-supplied --max-old-space-size (they may have set it higher) and
-    # avoid duplicating --expose-gc.
-    _tokens = env.get("NODE_OPTIONS", "").split()
+    # large transcripts / reasoning blobs. Keep heap sizing in NODE_OPTIONS,
+    # but never put --expose-gc there: modern Node rejects that flag from the
+    # environment before the TUI can start. If the caller already exported it,
+    # strip it and pass it directly to node argv when we invoke node ourselves.
+    _tokens = [t for t in env.get("NODE_OPTIONS", "").split() if t != "--expose-gc"]
     if not any(t.startswith("--max-old-space-size=") for t in _tokens):
         _tokens.append("--max-old-space-size=8192")
-    if "--expose-gc" not in _tokens:
-        _tokens.append("--expose-gc")
     env["NODE_OPTIONS"] = " ".join(_tokens)
+    argv = _add_tui_node_argv_flags(argv)
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
 
-    argv, cwd = _make_tui_argv(tui_dir, tui_dev)
     code: Optional[int] = None
     try:
         try:

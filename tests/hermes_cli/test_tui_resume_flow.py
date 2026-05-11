@@ -521,6 +521,54 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert active_path_during_call == active_path
     assert not active_path.exists()
     assert env["NODE_ENV"] == "production"
+    assert env["NODE_OPTIONS"] == "--max-old-space-size=8192"
+    assert captured["argv"] == ["node", "--expose-gc", "dist/entry.js"]
+
+
+def test_launch_tui_strips_expose_gc_from_existing_node_options(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("NODE_OPTIONS", "--trace-warnings --expose-gc --max-old-space-size=16384")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["/usr/local/bin/node", "dist/entry.js"], Path(".")),
+    )
+
+    def fake_call(argv, cwd=None, env=None):
+        captured.update({"argv": argv, "env": env})
+        return 1
+
+    monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["NODE_OPTIONS"] == "--trace-warnings --max-old-space-size=16384"
+    assert captured["argv"] == ["/usr/local/bin/node", "--expose-gc", "dist/entry.js"]
+
+
+def test_launch_tui_does_not_add_expose_gc_to_non_node_argv(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("NODE_OPTIONS", "--expose-gc")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["npm", "start"], Path(".")),
+    )
+
+    def fake_call(argv, cwd=None, env=None):
+        captured.update({"argv": argv, "env": env})
+        return 1
+
+    monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["NODE_OPTIONS"] == "--max-old-space-size=8192"
+    assert captured["argv"] == ["npm", "start"]
 
 
 def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, capsys):
