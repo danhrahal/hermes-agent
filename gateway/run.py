@@ -6105,6 +6105,9 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "afk":
+                return await self._handle_afk_command(event)
+
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
@@ -6473,6 +6476,9 @@ class GatewayRunner:
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "afk":
+            return await self._handle_afk_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -12160,6 +12166,56 @@ class GatewayRunner:
     def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
         """Return the platform-specific reply anchor for GatewayRunner sends."""
         return _reply_anchor_for_event(event)
+
+
+    # ------------------------------------------------------------------
+    # /afk — pending local CLI/TUI prompt bridge
+    # ------------------------------------------------------------------
+
+    async def _handle_afk_command(self, event: MessageEvent) -> str:
+        """Handle /afk pending and /afk answer <id> <response>."""
+        args = (event.get_command_args() or "").strip()
+        parts = args.split(maxsplit=2)
+        subcmd = parts[0].lower() if parts else "pending"
+
+        try:
+            from afk import answer_pending_prompt, list_pending_prompts
+        except Exception as exc:
+            logger.warning("AFK command unavailable: %s", exc)
+            return f"AFK bridge is unavailable: {exc}"
+
+        if subcmd in ("pending", "list", "ls", ""):
+            prompts = list_pending_prompts()
+            if not prompts:
+                return "No pending AFK prompts."
+            lines = ["Pending AFK prompts:"]
+            for prompt in prompts[:10]:
+                pid = prompt.get("id", "")
+                kind = prompt.get("kind", "prompt")
+                question = str(prompt.get("question", "")).replace("\n", " ")
+                if len(question) > 120:
+                    question = question[:119] + "…"
+                choices = prompt.get("choices") or []
+                choice_hint = ""
+                if choices:
+                    choice_hint = " choices=" + ", ".join(f"{i}. {c}" for i, c in enumerate(choices, 1))
+                lines.append(f"- {pid} ({kind}): {question}{choice_hint}")
+            lines.append("Reply with: /afk answer <id> <choice number or text>")
+            return "\n".join(lines)
+
+        if subcmd != "answer":
+            return "Usage: /afk pending  OR  /afk answer <id> <response>"
+        if len(parts) < 3:
+            return "Usage: /afk answer <id> <response>"
+
+        prompt_id = parts[1].strip()
+        answer = parts[2].strip()
+        source = event.source
+        answer_source = f"{source.platform.value if source.platform else 'gateway'}:{source.chat_id}:{source.user_id}"
+        result = answer_pending_prompt(prompt_id, answer, answer_source)
+        if not result.get("ok"):
+            return f"AFK answer rejected for {prompt_id}: {result.get('error', 'unknown error')}"
+        return f"AFK answer recorded for {prompt_id}: {result.get('answer')}"
 
 
     # ------------------------------------------------------------------

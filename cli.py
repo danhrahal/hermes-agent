@@ -1750,6 +1750,40 @@ def _format_process_notification(evt: dict) -> "str | None":
     )
 
 
+def _send_afk_process_event_alert(evt: dict) -> None:
+    """Best-effort AFK alert for CLI background process events."""
+    try:
+        from afk import send_afk_alert
+        evt_type = evt.get("type", "completion")
+        if evt_type == "completion":
+            kind = "job_done"
+            title = "AFK job done"
+        elif evt_type in {"watch_match", "watch_disabled"}:
+            kind = "blocker"
+            title = "AFK background process alert"
+        else:
+            return
+        sid = evt.get("session_id", "unknown")
+        cmd = str(evt.get("command", "unknown"))
+        lines = [
+            f"Event: {evt_type}",
+            f"Process: {sid}",
+            f"Command: {cmd[:1000]}",
+        ]
+        if evt_type == "completion":
+            lines.append(f"Exit code: {evt.get('exit_code', '?')}")
+        if evt.get("pattern"):
+            lines.append(f"Pattern: {evt.get('pattern')}")
+        if evt.get("message"):
+            lines.append(str(evt.get("message")))
+        output = str(evt.get("output", "") or "").strip()
+        if output:
+            lines.extend(["", "Output:", output[:1800]])
+        send_afk_alert(kind, title, lines, config=CLI_CONFIG, metadata={"process_id": sid, "event_type": evt_type})
+    except Exception as exc:
+        logger.debug("AFK process event alert failed: %s", exc)
+
+
 def _detect_file_drop(user_input: str) -> "dict | None":
     """Detect if *user_input* starts with a real local file path.
 
@@ -9796,12 +9830,29 @@ class HermesCLI:
         timeout = self._clarify_timeout_seconds()
         response_queue = queue.Queue()
         is_open_ended = not choices
+        pending_id = None
+        try:
+            from afk import afk_alert_enabled, afk_target, create_pending_prompt
+            if afk_alert_enabled("unanswered_question", CLI_CONFIG) and afk_target(CLI_CONFIG):
+                pending_id = create_pending_prompt(
+                    "clarify",
+                    question,
+                    choices if not is_open_ended else [],
+                    session_id=getattr(self, "session_id", ""),
+                    source="cli",
+                    safe_default="Hermes will use best judgement after timeout.",
+                    ttl_seconds=max(timeout + 300, 300),
+                )
+        except Exception as exc:
+            logger.debug("AFK pending clarify registration failed: %s", exc)
+            pending_id = None
 
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
             "response_queue": response_queue,
+            "pending_id": pending_id,
         }
         self._clarify_deadline = _time.monotonic() + timeout
         # Open-ended questions skip straight to freetext input
@@ -9824,8 +9875,27 @@ class HermesCLI:
             try:
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = 0
+                try:
+                    from afk import close_pending_prompt
+                    if pending_id:
+                        close_pending_prompt(pending_id, "closed")
+                except Exception:
+                    pass
                 return result
             except queue.Empty:
+                try:
+                    from afk import close_pending_prompt, poll_answer
+                    registry_answer = poll_answer(pending_id)
+                    if registry_answer is not None:
+                        self._clarify_state = None
+                        self._clarify_freetext = False
+                        self._clarify_deadline = 0
+                        self._invalidate()
+                        close_pending_prompt(pending_id, "answered")
+                        _cprint(f"\n{_DIM}(clarify answered via AFK bridge){_RST}")
+                        return registry_answer
+                except Exception:
+                    pass
                 remaining = self._clarify_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
@@ -9844,7 +9914,13 @@ class HermesCLI:
         self._clarify_deadline = 0
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
-        self._send_afk_unanswered_question_alert(question, choices, timeout)
+        self._send_afk_unanswered_question_alert(question, choices, timeout, pending_id=pending_id)
+        try:
+            from afk import close_pending_prompt
+            if pending_id:
+                close_pending_prompt(pending_id, "expired")
+        except Exception:
+            pass
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -9854,71 +9930,55 @@ class HermesCLI:
         """Return the clarify wait time, honoring AFK unanswered-question escalation."""
         clarify_cfg = CLI_CONFIG.get("clarify", {}) if isinstance(CLI_CONFIG, dict) else {}
         timeout = clarify_cfg.get("timeout", 120) if isinstance(clarify_cfg, dict) else 120
-
-        afk_cfg = CLI_CONFIG.get("afk", {}) if isinstance(CLI_CONFIG, dict) else {}
-        if isinstance(afk_cfg, dict) and is_truthy_value(afk_cfg.get("enabled_by_default", False)):
-            alert_on = afk_cfg.get("alert_on", [])
-            if isinstance(alert_on, str):
-                alert_on = [item.strip() for item in alert_on.split(",") if item.strip()]
-            if "unanswered_question" in set(alert_on or []):
-                timeout = afk_cfg.get("escalate_after_seconds", timeout)
-
         try:
-            timeout = int(float(timeout))
-        except (TypeError, ValueError):
-            timeout = 120
-        return max(timeout, 1)
-
-    def _send_afk_unanswered_question_alert(self, question, choices, timeout_seconds: int) -> None:
-        """Best-effort Discord/AFK alert when a CLI clarify prompt times out."""
-        afk_cfg = CLI_CONFIG.get("afk", {}) if isinstance(CLI_CONFIG, dict) else {}
-        if not isinstance(afk_cfg, dict):
-            return
-        if not is_truthy_value(afk_cfg.get("enabled_by_default", False)):
-            return
-
-        alert_on = afk_cfg.get("alert_on", [])
-        if isinstance(alert_on, str):
-            alert_on = [item.strip() for item in alert_on.split(",") if item.strip()]
-        if "unanswered_question" not in set(alert_on or []):
-            return
-
-        target = str(afk_cfg.get("target", "")).strip()
-        if not target:
-            return
-
-        lines = [
-            "AFK question timeout from Hermes CLI.",
-            "",
-            f"Question: {str(question).strip()}",
-        ]
-        cleaned_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
-        if cleaned_choices:
-            lines.append("")
-            lines.append("Options:")
-            lines.extend(f"{idx}. {choice}" for idx, choice in enumerate(cleaned_choices, start=1))
-        lines.extend([
-            "",
-            f"No local answer arrived after {timeout_seconds}s.",
-            "Safe default: Hermes will use best judgement and proceed unless the decision is unsafe or explicitly requires approval.",
-            "Continue: answer in the CLI/TUI to unblock this exact session. A Discord reply starts/continues the Discord session unless this task was launched from Discord.",
-        ])
-
-        try:
-            from tools.send_message_tool import send_message_tool
-            result = send_message_tool({
-                "action": "send",
-                "target": target,
-                "message": "\n".join(lines),
-            })
+            from afk import afk_escalate_after_seconds
+            return afk_escalate_after_seconds(CLI_CONFIG, fallback=timeout)
+        except Exception:
             try:
-                payload = json.loads(result) if isinstance(result, str) else result
-            except Exception:
-                payload = {}
-            if isinstance(payload, dict) and payload.get("error"):
-                logger.warning("AFK unanswered-question alert failed: %s", payload.get("error"))
+                timeout = int(float(timeout))
+            except (TypeError, ValueError):
+                timeout = 120
+            return max(timeout, 1)
+
+    def _send_afk_unanswered_question_alert(self, question, choices, timeout_seconds: int, *, pending_id: str | None = None) -> None:
+        """Best-effort Discord/AFK alert when a CLI clarify prompt times out."""
+        try:
+            from afk import format_unanswered_question_alert, send_afk_alert
+            message = format_unanswered_question_alert(question, choices, timeout_seconds, pending_id=pending_id)
+            result = send_afk_alert(
+                "unanswered_question",
+                "AFK question timeout",
+                message,
+                config=CLI_CONFIG,
+                metadata={"pending_id": pending_id} if pending_id else None,
+            )
+            if result.get("error") and result.get("sent") is False and result.get("error") != "alert disabled" and result.get("error") != "missing target":
+                logger.warning("AFK unanswered-question alert failed: %s", result.get("error"))
         except Exception as exc:
             logger.warning("AFK unanswered-question alert failed: %s", exc)
+
+    def _send_afk_approval_needed_alert(self, command: str, description: str, choices: list[str], timeout_seconds: int, pending_id: str | None) -> None:
+        """Best-effort AFK alert when a CLI approval prompt is waiting."""
+        try:
+            from afk import format_approval_needed_alert, send_afk_alert
+            message = format_approval_needed_alert(
+                command,
+                description,
+                choices,
+                pending_id=pending_id,
+                timeout_seconds=timeout_seconds,
+            )
+            result = send_afk_alert(
+                "approval_needed",
+                "AFK approval needed",
+                message,
+                config=CLI_CONFIG,
+                metadata={"pending_id": pending_id} if pending_id else None,
+            )
+            if result.get("error") and result.get("sent") is False and result.get("error") not in {"alert disabled", "missing target"}:
+                logger.warning("AFK approval-needed alert failed: %s", result.get("error"))
+        except Exception as exc:
+            logger.warning("AFK approval-needed alert failed: %s", exc)
 
     def _sudo_password_callback(self) -> str:
         """
@@ -9987,13 +10047,34 @@ class HermesCLI:
         with self._approval_lock:
             timeout = 60
             response_queue = queue.Queue()
+            approval_choices = choices if choices is not None else self._approval_choices(command, allow_permanent=allow_permanent)
+            pending_id = None
+            try:
+                from afk import afk_alert_enabled, afk_target, create_pending_prompt
+                bridge_choices = [choice for choice in approval_choices if choice != "view"]
+                if afk_alert_enabled("approval_needed", CLI_CONFIG) and afk_target(CLI_CONFIG):
+                    pending_id = create_pending_prompt(
+                        "approval",
+                        f"{description}\n{command}",
+                        bridge_choices,
+                        session_id=getattr(self, "session_id", ""),
+                        source="cli",
+                        safe_default="deny",
+                        ttl_seconds=max(timeout + 300, 300),
+                        metadata={"description": description, "command_preview": command[:500]},
+                    )
+                    self._send_afk_approval_needed_alert(command, description, bridge_choices, timeout, pending_id)
+            except Exception as exc:
+                logger.debug("AFK pending approval registration failed: %s", exc)
+                pending_id = None
 
             self._approval_state = {
                 "command": command,
                 "description": description,
-                "choices": choices if choices is not None else self._approval_choices(command, allow_permanent=allow_permanent),
+                "choices": approval_choices,
                 "selected": 0,
                 "response_queue": response_queue,
+                "pending_id": pending_id,
             }
             self._approval_deadline = _time.monotonic() + timeout
 
@@ -10006,8 +10087,26 @@ class HermesCLI:
                     self._approval_state = None
                     self._approval_deadline = 0
                     self._invalidate()
+                    try:
+                        from afk import close_pending_prompt
+                        if pending_id:
+                            close_pending_prompt(pending_id, "closed")
+                    except Exception:
+                        pass
                     return result
                 except queue.Empty:
+                    try:
+                        from afk import close_pending_prompt, poll_answer
+                        registry_answer = poll_answer(pending_id)
+                        if registry_answer is not None and registry_answer in {"once", "session", "always", "deny"}:
+                            self._approval_state = None
+                            self._approval_deadline = 0
+                            self._invalidate()
+                            close_pending_prompt(pending_id, "answered")
+                            _cprint(f"\n{_DIM}  ✓ Approval answered via AFK bridge: {registry_answer}{_RST}")
+                            return registry_answer
+                    except Exception:
+                        pass
                     remaining = self._approval_deadline - _time.monotonic()
                     if remaining <= 0:
                         break
@@ -10019,6 +10118,12 @@ class HermesCLI:
             self._approval_state = None
             self._approval_deadline = 0
             self._invalidate()
+            try:
+                from afk import close_pending_prompt
+                if pending_id:
+                    close_pending_prompt(pending_id, "expired")
+            except Exception:
+                pass
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
 
@@ -13015,6 +13120,7 @@ class HermesCLI:
                                     if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
                                         pass  # already delivered via tool result
                                     else:
+                                        _send_afk_process_event_alert(evt)
                                         _synth = _format_process_notification(evt)
                                         if _synth:
                                             self._pending_input.put(_synth)
@@ -13127,6 +13233,7 @@ class HermesCLI:
                                 _evt_sid = evt.get("session_id", "")
                                 if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
                                     continue  # already delivered via tool result
+                                _send_afk_process_event_alert(evt)
                                 _synth = _format_process_notification(evt)
                                 if _synth:
                                     self._pending_input.put(_synth)
