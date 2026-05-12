@@ -8463,6 +8463,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "mcp",
         "sessions",
         "insights",
+        "reliability",
         "version",
         "update",
         "uninstall",
@@ -9206,7 +9207,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "mcp", "memory", "model",
-        "pairing", "plugins", "profile", "sessions", "setup", "skills",
+        "pairing", "plugins", "profile", "reliability", "sessions", "setup", "skills",
         "slack", "status", "tools", "uninstall", "update", "version",
         "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
@@ -11283,6 +11284,46 @@ Examples:
             print(f"Error generating insights: {e}")
 
     insights_parser.set_defaults(func=cmd_insights)
+
+    # =========================================================================
+    # reliability command
+    # =========================================================================
+    reliability_parser = subparsers.add_parser(
+        "reliability",
+        help="Show local Hermes reliability health",
+        description="Summarize local cron, tool, model, and log health from state.db, cron history, and logs.",
+    )
+    reliability_parser.add_argument(
+        "--days", type=int, default=30, help="Number of days to analyze for state.db usage (default: 30)"
+    )
+    reliability_parser.add_argument(
+        "--limit", type=int, default=20, help="Maximum rows per section (default: 20)"
+    )
+    reliability_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    reliability_parser.add_argument(
+        "--export-events",
+        action="store_true",
+        help="Append a compact reliability_snapshot event to ~/.hermes/observability/events.jsonl",
+    )
+    reliability_subparsers = reliability_parser.add_subparsers(dest="reliability_command")
+    for _name, _help in (
+        ("cron", "Show cron run-history health"),
+        ("tools", "Show tool usage health"),
+        ("models", "Show model/session usage health"),
+        ("errors", "Show recent log error fingerprints"),
+    ):
+        _sub = reliability_subparsers.add_parser(_name, help=_help)
+        _sub.add_argument("--days", type=int, default=30, help="Number of days to analyze for state.db usage (default: 30)")
+        _sub.add_argument("--limit", type=int, default=20, help="Maximum rows (default: 20)")
+        _sub.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+        _sub.add_argument("--export-events", action="store_true", help="Append a compact reliability_snapshot event")
+
+    def cmd_reliability(args):
+        from hermes_cli.reliability import run_cli
+
+        return run_cli(args)
+
+    reliability_parser.set_defaults(func=cmd_reliability)
 
     # =========================================================================
     # claw command (OpenClaw migration)
