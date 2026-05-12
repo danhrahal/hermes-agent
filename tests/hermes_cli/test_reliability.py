@@ -141,3 +141,40 @@ def test_record_gateway_event_summarizes_delivery_status(tmp_path: Path):
     assert item["delivery_errors"] == 1
     assert item["avg_duration_ms"] == 9
     assert "boom" in summary["recent_errors"][0]["error"]
+
+
+def test_build_doctor_summary_warns_when_history_and_gateway_events_absent(monkeypatch):
+    class Job:
+        enabled = True
+
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [Job()])
+    summary = reliability.build_doctor_summary({
+        "cron": {"history_count": 0},
+        "tools": {"instrumented_calls": {"events_count": 3, "status_counts": {"ok": 3}}},
+        "models": {"instrumented_calls": {"events_count": 2, "status_counts": {"ok": 2}}},
+        "gateway": {"events_count": 0, "status_counts": {}},
+        "errors": {"fingerprints": []},
+    })
+
+    assert summary["status"] == "warn"
+    checks = {item["id"]: item for item in summary["checks"]}
+    assert checks["cron_history_present"]["status"] == "warn"
+    assert checks["gateway_delivery_events_present"]["status"] == "warn"
+    assert checks["tool_events_present"]["status"] == "ok"
+    assert checks["model_events_present"]["status"] == "ok"
+
+
+def test_build_doctor_summary_flags_repeated_error_fingerprints(monkeypatch):
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+    summary = reliability.build_doctor_summary({
+        "cron": {"history_count": 1},
+        "tools": {"instrumented_calls": {"events_count": 1, "status_counts": {"ok": 1}}},
+        "models": {"instrumented_calls": {"events_count": 1, "status_counts": {"ok": 1}}},
+        "gateway": {"events_count": 1, "status_counts": {"delivered": 1}},
+        "errors": {"fingerprints": [{"fingerprint": "boom", "count": 4}]},
+    })
+
+    checks = {item["id"]: item for item in summary["checks"]}
+    assert summary["status"] == "warn"
+    assert checks["recent_error_fingerprints"]["status"] == "warn"
+    assert checks["gateway_delivery_events_present"]["status"] == "ok"

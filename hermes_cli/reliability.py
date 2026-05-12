@@ -628,21 +628,191 @@ def summarize_errors(home: Path, limit: int) -> dict[str, Any]:
     }
 
 
+def _check(status: str, check_id: str, title: str, details: str, suggested_action: str, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "status": status,
+        "title": title,
+        "details": details,
+        "suggested_action": suggested_action,
+        "evidence": evidence or {},
+    }
+
+
+def build_doctor_summary(sources: dict[str, Any]) -> dict[str, Any]:
+    """Build actionable local reliability checks from snapshot sources."""
+    checks: list[dict[str, Any]] = []
+    cron = sources.get("cron") or {}
+    tools = sources.get("tools") or {}
+    models = sources.get("models") or {}
+    gateway = sources.get("gateway") or {}
+    errors = sources.get("errors") or {}
+
+    active_jobs = None
+    total_jobs = None
+    try:
+        from cron.jobs import load_jobs
+
+        jobs = load_jobs()
+        total_jobs = len(jobs)
+        active_jobs = sum(1 for job in jobs if getattr(job, "enabled", True))
+    except Exception:
+        pass
+
+    if active_jobs is not None:
+        checks.append(_check(
+            "ok",
+            "cron_jobs_configured",
+            "Cron jobs are configured",
+            f"{active_jobs} active / {total_jobs} total scheduled jobs are visible to the local cron store.",
+            "No action unless expected jobs are missing.",
+            {"active_jobs": active_jobs, "total_jobs": total_jobs},
+        ))
+    else:
+        checks.append(_check(
+            "warn",
+            "cron_jobs_configured",
+            "Cron job inventory could not be loaded",
+            "The reliability doctor could not read cron job metadata.",
+            "Run `hermes cron status --json` and inspect cron storage/logs.",
+        ))
+
+    history_count = int(cron.get("history_count") or 0)
+    if history_count > 0:
+        checks.append(_check(
+            "ok",
+            "cron_history_present",
+            "Cron run history is collecting",
+            f"Found {history_count} cron run-history rows.",
+            "No action.",
+            {"history_count": history_count},
+        ))
+    elif active_jobs:
+        checks.append(_check(
+            "warn",
+            "cron_history_present",
+            "Cron run history has no rows yet",
+            "Active cron jobs exist, but `~/.hermes/cron/runs.jsonl` has no recorded attempts yet.",
+            "Wait for the next scheduled run after the gateway/scheduler restart, or run one low-risk job manually only after approval.",
+            {"history_count": history_count, "active_jobs": active_jobs},
+        ))
+    else:
+        checks.append(_check(
+            "ok",
+            "cron_history_present",
+            "Cron run history is empty and no active jobs were detected",
+            "No active cron workload was detected by this doctor check.",
+            "No action.",
+            {"history_count": history_count},
+        ))
+
+    tool_events = (tools.get("instrumented_calls") or {}).get("events_count") or 0
+    if tool_events:
+        checks.append(_check(
+            "ok",
+            "tool_events_present",
+            "Structured tool events are collecting",
+            f"Found {tool_events} bounded `tool_call` events.",
+            "Use `hermes reliability tools --limit 20` to inspect slow/error-prone tools.",
+            {"events_count": tool_events, "status_counts": (tools.get("instrumented_calls") or {}).get("status_counts", {})},
+        ))
+    else:
+        checks.append(_check(
+            "warn",
+            "tool_events_present",
+            "No structured tool events found",
+            "No `tool_call` rows were found in the local observability event stream.",
+            "Start a new Hermes process with the instrumentation loaded and run a safe tool call.",
+        ))
+
+    model_events = (models.get("instrumented_calls") or {}).get("events_count") or 0
+    if model_events:
+        checks.append(_check(
+            "ok",
+            "model_events_present",
+            "Structured model events are collecting",
+            f"Found {model_events} bounded `model_call` events.",
+            "Use `hermes reliability models --limit 20` to inspect latency/token/cost patterns.",
+            {"events_count": model_events, "status_counts": (models.get("instrumented_calls") or {}).get("status_counts", {})},
+        ))
+    else:
+        checks.append(_check(
+            "warn",
+            "model_events_present",
+            "No structured model events found",
+            "No `model_call` rows were found in the local observability event stream.",
+            "Start a new Hermes process with the instrumentation loaded and complete one model turn.",
+        ))
+
+    gateway_events = int(gateway.get("events_count") or 0)
+    if gateway_events:
+        gateway_status = "error" if gateway.get("status_counts", {}).get("delivery_error") else "ok"
+        checks.append(_check(
+            gateway_status,
+            "gateway_delivery_events_present",
+            "Gateway delivery events are collecting",
+            f"Found {gateway_events} `gateway_delivery` events.",
+            "Use `hermes reliability gateway --limit 20` to inspect delivery status by platform.",
+            {"events_count": gateway_events, "status_counts": gateway.get("status_counts", {})},
+        ))
+    else:
+        checks.append(_check(
+            "warn",
+            "gateway_delivery_events_present",
+            "No gateway delivery events found",
+            "No `gateway_delivery` rows were found. This can be normal immediately after deploying instrumentation or before any post-restart deliveries.",
+            "After a known safe gateway delivery occurs, re-run `hermes reliability gateway --limit 20`.",
+            {"events_count": gateway_events},
+        ))
+
+    fingerprints = errors.get("fingerprints") or []
+    repeated = [item for item in fingerprints if int(item.get("count") or 0) >= 3]
+    if repeated:
+        worst = repeated[0]
+        checks.append(_check(
+            "warn",
+            "recent_error_fingerprints",
+            "Repeated log fingerprints detected",
+            f"Top repeated fingerprint appears {worst.get('count')} times: {worst.get('fingerprint')}",
+            "Run `hermes reliability errors --limit 20` and triage recurring fingerprints separately from observability instrumentation.",
+            {"repeated_count": len(repeated), "top": worst},
+        ))
+    else:
+        checks.append(_check(
+            "ok",
+            "recent_error_fingerprints",
+            "No repeated recent log fingerprints over threshold",
+            "No error fingerprint with count >= 3 was found in the bounded log scan.",
+            "No action.",
+        ))
+
+    severity = {"ok": 0, "warn": 1, "error": 2}
+    overall = max((check["status"] for check in checks), key=lambda status: severity.get(status, 0), default="ok")
+    return {
+        "ok": overall != "error",
+        "status": overall,
+        "checks": checks,
+        "status_counts": dict(Counter(check["status"] for check in checks)),
+    }
+
+
 def build_snapshot(*, days: int = 30, limit: int = 20, home: Path | None = None) -> dict[str, Any]:
     root = (home or _home()).resolve()
+    sources = {
+        "cron": summarize_cron(root, limit),
+        "tools": summarize_tools(root, days, limit),
+        "models": summarize_models(root, days, limit),
+        "gateway": summarize_gateway_events(root, limit),
+        "errors": summarize_errors(root, limit),
+        "events": {"path": str(events_file(root)), "recent": read_events(home=root, limit=min(limit, 50))},
+    }
+    sources["doctor"] = build_doctor_summary(sources)
     return {
         "schema_version": 1,
         "generated_at": _now_iso(),
         "home": str(root),
         "window_days": max(1, days),
-        "sources": {
-            "cron": summarize_cron(root, limit),
-            "tools": summarize_tools(root, days, limit),
-            "models": summarize_models(root, days, limit),
-            "gateway": summarize_gateway_events(root, limit),
-            "errors": summarize_errors(root, limit),
-            "events": {"path": str(events_file(root)), "recent": read_events(home=root, limit=min(limit, 50))},
-        },
+        "sources": sources,
         "local_truth_note": "Local reliability is derived from state.db, cron/runs.jsonl, logs, and optional observability/events.jsonl. Langfuse/Sentry/Otel are optional external layers, not the source of truth.",
     }
 
@@ -722,6 +892,17 @@ def print_terminal(snapshot: dict[str, Any], view: str) -> None:
         print("\nError fingerprints")
         for item in (errors.get("fingerprints") or [])[:20]:
             print(f"- {item.get('count')}x {item.get('fingerprint')}")
+    if view in {"summary", "doctor"}:
+        doctor = sources.get("doctor", {})
+        print("\nReliability doctor")
+        _print_kv("status", doctor.get("status"))
+        _print_kv("status_counts", doctor.get("status_counts"))
+        for item in (doctor.get("checks") or [])[:20]:
+            print(f"- [{item.get('status')}] {item.get('title')}")
+            if item.get("details"):
+                print(f"  details: {item.get('details')}")
+            if item.get("suggested_action"):
+                print(f"  action: {item.get('suggested_action')}")
 
 
 def run_cli(args: Any) -> int:

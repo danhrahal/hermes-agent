@@ -11312,6 +11312,7 @@ Examples:
         ("models", "Show model/session usage health"),
         ("gateway", "Show gateway delivery event health"),
         ("errors", "Show recent log error fingerprints"),
+        ("doctor", "Show actionable local reliability checks"),
     ):
         _sub = reliability_subparsers.add_parser(_name, help=_help)
         _sub.add_argument("--days", type=int, default=30, help="Number of days to analyze for state.db usage (default: 30)")
