@@ -94,6 +94,124 @@ def read_events(*, home: Path | None = None, limit: int = 200) -> list[dict[str,
     return read_jsonl(events_file(home), limit=limit)
 
 
+def _parse_event_time(value: Any) -> dt.datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def event_stream_stats(*, home: Path | None = None) -> dict[str, Any]:
+    """Return cheap metadata for the local observability event stream."""
+    path = events_file(home)
+    if not path.exists():
+        return {"path": str(path), "exists": False, "size_bytes": 0, "line_count": 0}
+    line_count = 0
+    oldest: str | None = None
+    newest: str | None = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                line_count += 1
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                recorded_at = row.get("recorded_at")
+                if recorded_at:
+                    oldest = oldest or str(recorded_at)
+                    newest = str(recorded_at)
+    except OSError as exc:
+        return {"path": str(path), "exists": True, "ok": False, "error": str(exc)}
+    return {
+        "path": str(path),
+        "exists": True,
+        "ok": True,
+        "size_bytes": path.stat().st_size,
+        "line_count": line_count,
+        "oldest_recorded_at": oldest,
+        "newest_recorded_at": newest,
+    }
+
+
+def rotate_observability_events(*, home: Path | None = None, max_bytes: int, keep: int = 3) -> dict[str, Any]:
+    """Rotate events.jsonl to events.jsonl.1 when it exceeds max_bytes.
+
+    Rotation is explicit, local, and file-based; it never uploads data and it
+    keeps only numbered siblings next to the source file.
+    """
+    path = events_file(home)
+    if max_bytes <= 0 or not path.exists() or path.stat().st_size <= max_bytes:
+        return {"rotated": False, "path": str(path), "size_bytes": path.stat().st_size if path.exists() else 0}
+    keep = max(1, int(keep or 1))
+    for idx in range(keep, 0, -1):
+        src = path.with_name(path.name + f".{idx}")
+        dst = path.with_name(path.name + f".{idx + 1}")
+        if not src.exists():
+            continue
+        if idx == keep:
+            src.unlink(missing_ok=True)
+        else:
+            src.replace(dst)
+    rotated = path.with_name(path.name + ".1")
+    path.replace(rotated)
+    path.touch(mode=0o600)
+    return {"rotated": True, "path": str(path), "rotated_to": str(rotated), "max_bytes": max_bytes, "keep": keep}
+
+
+def prune_observability_events(
+    *,
+    home: Path | None = None,
+    retention_days: int | None = None,
+    max_events: int | None = None,
+) -> dict[str, Any]:
+    """Compact events.jsonl by age and/or maximum retained event count."""
+    path = events_file(home)
+    if not path.exists():
+        return {"ok": True, "path": str(path), "before": 0, "after": 0, "removed": 0}
+    rows = read_jsonl(path)
+    before = len(rows)
+    kept = rows
+    cutoff: dt.datetime | None = None
+    if retention_days is not None and retention_days > 0:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
+        kept = [row for row in kept if (_parse_event_time(row.get("recorded_at")) or dt.datetime.now(dt.timezone.utc)) >= cutoff]
+    if max_events is not None and max_events > 0 and len(kept) > max_events:
+        kept = kept[-max_events:]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as fh:
+        for row in kept:
+            fh.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return {
+        "ok": True,
+        "path": str(path),
+        "before": before,
+        "after": len(kept),
+        "removed": before - len(kept),
+        "retention_days": retention_days,
+        "max_events": max_events,
+        "cutoff": cutoff.isoformat() if cutoff else None,
+    }
+
+
 def _event_status_from_result(result: Any) -> str:
     if isinstance(result, str):
         try:
@@ -647,6 +765,7 @@ def build_doctor_summary(sources: dict[str, Any]) -> dict[str, Any]:
     models = sources.get("models") or {}
     gateway = sources.get("gateway") or {}
     errors = sources.get("errors") or {}
+    events = sources.get("events") or {}
 
     active_jobs = None
     total_jobs = None
@@ -765,6 +884,27 @@ def build_doctor_summary(sources: dict[str, Any]) -> dict[str, Any]:
             {"events_count": gateway_events},
         ))
 
+    line_count = int(events.get("line_count") or 0)
+    size_bytes = int(events.get("size_bytes") or 0)
+    if line_count > 100_000 or size_bytes > 50_000_000:
+        checks.append(_check(
+            "warn",
+            "event_stream_retention",
+            "Observability event stream may need retention",
+            f"events.jsonl has {line_count} lines and {size_bytes} bytes.",
+            "Run `hermes reliability --prune-events --retention-days 30 --max-events 50000` or rotate with `--rotate-events-bytes`.",
+            {"line_count": line_count, "size_bytes": size_bytes, "path": events.get("path")},
+        ))
+    else:
+        checks.append(_check(
+            "ok",
+            "event_stream_retention",
+            "Observability event stream is within local retention guardrails",
+            f"events.jsonl has {line_count} lines and {size_bytes} bytes.",
+            "No action.",
+            {"line_count": line_count, "size_bytes": size_bytes, "path": events.get("path")},
+        ))
+
     fingerprints = errors.get("fingerprints") or []
     repeated = [item for item in fingerprints if int(item.get("count") or 0) >= 3]
     if repeated:
@@ -804,7 +944,7 @@ def build_snapshot(*, days: int = 30, limit: int = 20, home: Path | None = None)
         "models": summarize_models(root, days, limit),
         "gateway": summarize_gateway_events(root, limit),
         "errors": summarize_errors(root, limit),
-        "events": {"path": str(events_file(root)), "recent": read_events(home=root, limit=min(limit, 50))},
+        "events": {**event_stream_stats(home=root), "recent": read_events(home=root, limit=min(limit, 50))},
     }
     sources["doctor"] = build_doctor_summary(sources)
     return {
@@ -909,12 +1049,31 @@ def run_cli(args: Any) -> int:
     view = getattr(args, "reliability_command", None) or "summary"
     if view == "export":
         view = "summary"
+    maintenance: dict[str, Any] = {}
+    rotate_bytes = int(getattr(args, "rotate_events_bytes", 0) or 0)
+    if rotate_bytes > 0:
+        maintenance["rotation"] = rotate_observability_events(
+            max_bytes=rotate_bytes,
+            keep=int(getattr(args, "rotate_events_keep", 3) or 3),
+        )
+    if getattr(args, "prune_events", False):
+        maintenance["prune"] = prune_observability_events(
+            retention_days=int(getattr(args, "retention_days", 30) or 30),
+            max_events=int(getattr(args, "max_events", 50_000) or 50_000),
+        )
     snapshot = build_snapshot(days=getattr(args, "days", 30), limit=getattr(args, "limit", 20))
+    if maintenance:
+        snapshot["maintenance"] = maintenance
     if getattr(args, "export_events", False):
         snapshot["exported_event"] = export_snapshot_event(snapshot)
     if getattr(args, "json", False):
         print(json.dumps(snapshot if view == "summary" else snapshot.get("sources", {}).get(view, {}), indent=2, ensure_ascii=False))
     else:
+        if maintenance:
+            print("Reliability event maintenance")
+            for key, value in maintenance.items():
+                _print_kv(key, value)
+            print("")
         print_terminal(snapshot, view)
         print("\nLocal truth note:")
         print(snapshot["local_truth_note"])

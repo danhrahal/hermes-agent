@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 from pathlib import Path
@@ -22,6 +23,31 @@ def test_append_event_writes_local_event(tmp_path: Path):
     assert rows[0]["schema_version"] == 1
     assert rows[0]["event_id"]
     assert rows[0]["recorded_at"]
+
+
+def test_observability_event_retention_and_rotation(tmp_path: Path):
+    path = reliability.events_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=40)).isoformat()
+    recent = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    rows = [
+        {"event_type": "tool_call", "recorded_at": old, "n": 1},
+        {"event_type": "tool_call", "recorded_at": recent, "n": 2},
+        {"event_type": "model_call", "recorded_at": recent, "n": 3},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    stats = reliability.event_stream_stats(home=tmp_path)
+    assert stats["line_count"] == 3
+    result = reliability.prune_observability_events(home=tmp_path, retention_days=30, max_events=1)
+    assert result["before"] == 3
+    assert result["after"] == 1
+    assert reliability.read_events(home=tmp_path, limit=10)[0]["n"] == 3
+
+    rotation = reliability.rotate_observability_events(home=tmp_path, max_bytes=1, keep=2)
+    assert rotation["rotated"] is True
+    assert (path.parent / "events.jsonl.1").exists()
+    assert path.exists()
 
 
 def test_summarize_cron_reads_runs_jsonl(tmp_path: Path, monkeypatch):

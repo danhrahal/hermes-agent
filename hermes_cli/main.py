@@ -11305,6 +11305,11 @@ Examples:
         action="store_true",
         help="Append a compact reliability_snapshot event to ~/.hermes/observability/events.jsonl",
     )
+    reliability_parser.add_argument("--prune-events", action="store_true", help="Compact observability/events.jsonl by age/count before reporting")
+    reliability_parser.add_argument("--retention-days", type=int, default=30, help="Days of observability events to keep when --prune-events is set (default: 30)")
+    reliability_parser.add_argument("--max-events", type=int, default=50000, help="Maximum events to keep when --prune-events is set (default: 50000)")
+    reliability_parser.add_argument("--rotate-events-bytes", type=int, default=0, help="Rotate events.jsonl before reporting if it exceeds this many bytes")
+    reliability_parser.add_argument("--rotate-events-keep", type=int, default=3, help="Number of rotated events.jsonl.N files to keep (default: 3)")
     reliability_subparsers = reliability_parser.add_subparsers(dest="reliability_command")
     for _name, _help in (
         ("cron", "Show cron run-history health"),
@@ -11319,6 +11324,11 @@ Examples:
         _sub.add_argument("--limit", type=int, default=20, help="Maximum rows (default: 20)")
         _sub.add_argument("--json", action="store_true", help="Print machine-readable JSON")
         _sub.add_argument("--export-events", action="store_true", help="Append a compact reliability_snapshot event")
+        _sub.add_argument("--prune-events", action="store_true", help="Compact observability/events.jsonl by age/count before reporting")
+        _sub.add_argument("--retention-days", type=int, default=30, help="Days of observability events to keep when --prune-events is set")
+        _sub.add_argument("--max-events", type=int, default=50000, help="Maximum events to keep when --prune-events is set")
+        _sub.add_argument("--rotate-events-bytes", type=int, default=0, help="Rotate events.jsonl before reporting if it exceeds this many bytes")
+        _sub.add_argument("--rotate-events-keep", type=int, default=3, help="Number of rotated events.jsonl.N files to keep")
 
     def cmd_reliability(args):
         from hermes_cli.reliability import run_cli
