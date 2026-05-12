@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import hermes_cli.plugins as plugins_mod
+from hermes_cli import reliability
 import model_tools
 
 
@@ -131,6 +132,29 @@ def test_post_tool_call_remains_observational(monkeypatch):
         invoke_hook=_hook,
     )
     assert out == '{"output": "original"}'
+
+
+def test_handle_function_call_records_local_tool_observability_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="dummy_tool",
+        tool_args={"secret_arg": "do not store this value"},
+        dispatch_result='{"output": "original"}',
+    )
+
+    assert out == '{"output": "original"}'
+    rows = reliability.read_events(home=tmp_path, limit=10)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_type"] == "tool_call"
+    assert row["tool_name"] == "dummy_tool"
+    assert row["session_id"] == "s1"
+    assert row["tool_call_id"] == "tc1"
+    assert row["args_keys"] == ["secret_arg"]
+    assert "do not store" not in json.dumps(row)
 
 
 def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):

@@ -11310,6 +11310,7 @@ Examples:
         ("cron", "Show cron run-history health"),
         ("tools", "Show tool usage health"),
         ("models", "Show model/session usage health"),
+        ("gateway", "Show gateway delivery event health"),
         ("errors", "Show recent log error fingerprints"),
     ):
         _sub = reliability_subparsers.add_parser(_name, help=_help)

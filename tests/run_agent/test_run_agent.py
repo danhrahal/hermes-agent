@@ -2494,7 +2494,10 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
-    def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
+    def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from hermes_cli import reliability
+
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
@@ -2526,6 +2529,10 @@ class TestRunConversation:
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
+        model_events = [row for row in reliability.read_events(home=tmp_path, limit=10) if row.get("event_type") == "model_call"]
+        assert len(model_events) == 2
+        assert [row["api_call_count"] for row in model_events] == [1, 2]
+        assert all(row["session_id"] == agent.session_id for row in model_events)
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)

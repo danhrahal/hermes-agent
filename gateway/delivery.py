@@ -9,6 +9,7 @@ Routes messages to the appropriate destination based on:
 """
 
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -150,18 +151,55 @@ class DeliveryRouter:
         results = {}
         
         for target in targets:
+            started = time.monotonic()
+            target_label = target.to_string()
             try:
                 if target.platform == Platform.LOCAL:
                     result = self._deliver_local(content, job_id, job_name, metadata)
+                    delivery_status = "saved_local"
                 else:
                     result = await self._deliver_to_platform(target, content, metadata)
+                    delivery_status = "delivered"
+                duration_ms = int((time.monotonic() - started) * 1000)
+                try:
+                    from hermes_cli.reliability import record_gateway_delivery_event
+                    message_id = result.get("message_id") if isinstance(result, dict) else None
+                    record_gateway_delivery_event(
+                        platform=target.platform.value,
+                        target=target_label,
+                        status=delivery_status,
+                        duration_ms=duration_ms,
+                        content_chars=len(content),
+                        job_id=job_id or (metadata or {}).get("job_id"),
+                        job_name=job_name,
+                        session_id=(metadata or {}).get("session_id"),
+                        message_id=message_id,
+                    )
+                except Exception as obs_err:
+                    logger.debug("gateway delivery observability event error: %s", obs_err)
                 
-                results[target.to_string()] = {
+                results[target_label] = {
                     "success": True,
                     "result": result
                 }
             except Exception as e:
-                results[target.to_string()] = {
+                duration_ms = int((time.monotonic() - started) * 1000)
+                try:
+                    from hermes_cli.reliability import record_gateway_delivery_event
+                    record_gateway_delivery_event(
+                        platform=target.platform.value,
+                        target=target_label,
+                        status="delivery_error",
+                        duration_ms=duration_ms,
+                        error=str(e),
+                        content_chars=len(content),
+                        job_id=job_id or (metadata or {}).get("job_id"),
+                        job_name=job_name,
+                        session_id=(metadata or {}).get("session_id"),
+                    )
+                except Exception as obs_err:
+                    logger.debug("gateway delivery observability event error: %s", obs_err)
+                results[target_label] = {
                     "success": False,
                     "error": str(e)
                 }

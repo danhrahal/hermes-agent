@@ -14572,6 +14572,27 @@ class AIAgent:
                 except Exception:
                     pass
 
+                try:
+                    from hermes_cli.reliability import record_model_call_event as _record_model_call_event
+                    _record_model_call_event(
+                        task_id=effective_task_id,
+                        session_id=self.session_id or "",
+                        platform=self.platform or "",
+                        model=self.model,
+                        provider=self.provider,
+                        api_mode=self.api_mode,
+                        api_call_count=api_call_count,
+                        duration_s=api_duration,
+                        finish_reason=finish_reason,
+                        message_count=len(api_messages),
+                        response_model=getattr(response, "model", None),
+                        usage=self._usage_summary_for_api_request_hook(response),
+                        assistant_content_chars=len(_assistant_text),
+                        assistant_tool_call_count=len(_assistant_tool_calls),
+                    )
+                except Exception:
+                    pass
+
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
                     if self.verbose_logging:

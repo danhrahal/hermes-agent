@@ -65,3 +65,79 @@ def test_summarize_tools_from_state_db(tmp_path: Path):
     assert summary["ok"] is True
     assert {item["name"]: item["count"] for item in summary["tools"]} == {"terminal": 1, "skill_view": 1}
     assert summary["skills"] == [{"name": "hermes-agent", "count": 1}]
+
+
+def test_record_tool_call_event_is_bounded_and_summarized(tmp_path: Path):
+    reliability.record_tool_call_event(
+        tool_name="terminal",
+        args={"command": "echo secret-ish payload that should not be stored"},
+        result=json.dumps({"output": "x"}),
+        duration_ms=42,
+        task_id="task-1",
+        session_id="session-1",
+        tool_call_id="call-1",
+        home=tmp_path,
+    )
+
+    rows = reliability.read_events(home=tmp_path, limit=10)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_type"] == "tool_call"
+    assert row["tool_name"] == "terminal"
+    assert row["status"] == "ok"
+    assert row["duration_ms"] == 42
+    assert row["args_keys"] == ["command"]
+    assert "secret-ish payload" not in json.dumps(row)
+
+    summary = reliability.summarize_tool_events(tmp_path, limit=10)
+    assert summary["events_count"] == 1
+    assert summary["tools"][0]["name"] == "terminal"
+    assert summary["tools"][0]["avg_duration_ms"] == 42
+
+
+def test_record_model_call_event_summarizes_latency_tokens_and_cost(tmp_path: Path):
+    reliability.record_model_call_event(
+        model="gpt-test",
+        provider="openai",
+        api_mode="chat_completions",
+        duration_ms=1200,
+        status="ok",
+        usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "estimated_cost_usd": 0.0123},
+        session_id="session-1",
+        task_id="task-1",
+        home=tmp_path,
+    )
+
+    summary = reliability.summarize_model_events(tmp_path, limit=10)
+    assert summary["events_count"] == 1
+    item = summary["models"][0]
+    assert item["provider"] == "openai"
+    assert item["model"] == "gpt-test"
+    assert item["api_calls"] == 1
+    assert item["avg_duration_ms"] == 1200
+    assert item["input_tokens"] == 10
+    assert item["output_tokens"] == 5
+    assert item["estimated_cost_usd"] == 0.0123
+
+
+def test_record_gateway_event_summarizes_delivery_status(tmp_path: Path):
+    reliability.record_gateway_delivery_event(
+        platform="telegram",
+        target="telegram:123",
+        status="delivery_error",
+        duration_ms=9,
+        error="boom",
+        content_chars=1234,
+        job_id="job-1",
+        home=tmp_path,
+    )
+
+    summary = reliability.summarize_gateway_events(tmp_path, limit=10)
+    assert summary["events_count"] == 1
+    assert summary["status_counts"] == {"delivery_error": 1}
+    item = summary["platforms"][0]
+    assert item["platform"] == "telegram"
+    assert item["deliveries"] == 1
+    assert item["delivery_errors"] == 1
+    assert item["avg_duration_ms"] == 9
+    assert "boom" in summary["recent_errors"][0]["error"]
